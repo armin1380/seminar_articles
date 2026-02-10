@@ -1,192 +1,134 @@
-# user2f.py - RECEIVER
-import socket
-import hashlib
-import os
-import random
-import time
-import base64
-import pickle
-import struct
-import numpy as np
+from flask import Flask, render_template, request, jsonify
+import socket, os, pickle, struct, numpy as np, requests
 
-# ===================== PQC Parameters =======================
-n = 256
-q = 3329
-k = 2
-eta = 2
+app = Flask(__name__)
 
-# ===============================
-# Utilities & Math
-# ===============================
-def mod_q(x):
-    return np.mod(x, q).astype(np.int32)
+# --- NETWORK CONFIG (Adjust per machine) ---
+MY_IP = "192.168.3.11"
+DEST_IP = "192.168.1.10"
+KDC_IP = "192.168.100.100"
+KDC_PORT = 5000
+SAVE_DIR = os.path.expanduser("~/received_files/")
+if not os.path.exists(SAVE_DIR): os.makedirs(SAVE_DIR)
 
-def shake128(seed, length):
-    return hashlib.shake_128(seed).digest(length)
+STATE = {"reg": False, "log": False, "auth": False, "session_key": None}
 
-# (Other math functions assumed identical to user1f)
+# --- PQC Logic ---
+n, q, k = 256, 3329, 2
+
+def get_fixed_matrix():
+    state = np.random.RandomState(42)
+    return state.randint(0, q, (k, k, n))
+
 def keygen():
-    sk = os.urandom(32)
-    pk = (np.zeros((k, k, n)), b'seed') 
-    return pk, sk
+    A = get_fixed_matrix()
+    s = np.random.randint(-1, 2, (k, n))
+    e = np.random.randint(-1, 2, (k, n))
+    t = np.mod(np.einsum("ijk,jk->ik", A, s) + e, q)
+    return t, s
 
-# ===============================
-# Cryptography Utilities
-# ===============================
+def decrypt_pqc(sk, ct):
+    u, v = ct
+    # Recover message polynomial: m = v - s*u
+    dec_poly = np.mod(v - np.sum(u * sk, axis=0), q)
+    # Map back to bits: 1 if closer to q/2, 0 if closer to 0
+    bits = ((dec_poly > q // 4) & (dec_poly < 3 * q // 4)).astype(np.uint8)
+    return np.packbits(bits[:256]).tobytes()
 
-def xor(data: bytes, key: bytes) -> bytes:
-    return bytes(a ^ b for a, b in zip(data, key))
+MY_PK, MY_SK = keygen()
 
-def stream_cipher(key: bytes, nonce: bytes, data: bytes) -> bytes:
-    """
-    Expands the Session Key using SHAKE256 to match the data length.
-    """
-    seed = key + nonce
-    keystream = hashlib.shake_256(seed).digest(len(data))
-    return bytes(d ^ k for d, k in zip(data, keystream))
+def send_msg(sock, data):
+    sock.sendall(struct.pack('!I', len(data)) + data)
 
-# ===============================
-# Networking Wrappers
-# ===============================
-client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-client.connect(("192.168.1.10", 9999)) # Connect to SERVER IP
+def recv_msg(sock):
+    raw_len = sock.recv(4)
+    if not raw_len: return None
+    msglen = struct.unpack('!I', raw_len)[0]
+    data = b""
+    while len(data) < msglen:
+        data += sock.recv(msglen - len(data))
+    return data
 
-def send_pickle(conn, data):
-    serialized_data = pickle.dumps(data)
-    length = len(serialized_data)
-    conn.sendall(struct.pack('!I', length))
-    conn.sendall(serialized_data)
+# --- Routes ---
+@app.route('/')
+def index():
+    return render_template('index.html', state=STATE)
 
-def recv_pickle(conn):
-    length_data = conn.recv(4)
-    if not length_data:
-        return None
-    length = struct.unpack('!I', length_data)[0]
-    data = b''
-    while len(data) < length:
-        packet = conn.recv(length - len(data))
-        if not packet:
-            return None
-        data += packet
-    return pickle.loads(data)
+@app.route('/register', methods=['POST'])
+def register():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.connect((KDC_IP, KDC_PORT))
+        send_msg(s, b"REGISTER")
+        send_msg(s, pickle.dumps(MY_PK))
+        if recv_msg(s) == b"REGISTER_OK":
+            STATE["reg"] = True
+            return jsonify({"status": "success"})
+    except Exception as e: return jsonify({"status": "error", "msg": str(e)})
 
-def send(msg):
-    message = pickle.dumps(msg)
-    client.send(message)
-    return message
+@app.route('/login', methods=['POST'])
+def login():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.connect((KDC_IP, KDC_PORT))
+        send_msg(s, b"LOGIN")
+        if recv_msg(s) == b"LOGIN_OK":
+            STATE["log"] = True
+            return jsonify({"status": "success"})
+    except: pass
+    return jsonify({"status": "error", "msg": "Login failed"})
 
-def receive(conn):
-    data = conn.recv(2048)
-    return pickle.loads(data)
-
-# ===============================
-# User Class
-# ===============================
-class User:
-    def __init__(self, t, sk, pk):
-        self.t = t
-        self.sk = sk
-        self.pk = pk
-
-    def register(self, IP):
-        send_pickle(client, self.pk)
-        send_pickle(client, IP)
-        print("Registration Request Sent")
-
-    def login(self, IP):
-        send(IP)
-        print(f"Login Request Sent for {IP}")
-
-    def kerberos_recived(self, sk, client, IP):
-        """
-        Performs authentication from Receiver side.
-        Returns: session_key (bytes) if successful, None otherwise.
-        """
-        role = "Receiver"
-        send(role)
-
-        print("Waiting for ticket from Sender...")
+@app.route('/authenticate', methods=['POST'])
+def authenticate():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.connect((KDC_IP, KDC_PORT))
+        send_msg(s, b"GET_TICKET")
+        send_msg(s, DEST_IP.encode())
+        data = recv_msg(s)
+        ticket_src, ticket_dst, raw_key_hex = pickle.loads(data)
         
-        # 1. Receive Ticket forwarded by Sender (via Server)
-        Y_ID = recv_pickle(client)
-        Y_key = recv_pickle(client)
+        # Decrypt to get the session key
+        decrypted_key = decrypt_pqc(MY_SK, ticket_src)
+        STATE["session_key"] = decrypted_key
+        STATE["auth"] = True
+        
+        print(f"[DEBUG] Decrypted Session Key: {decrypted_key.hex()[:10]}...")
+        return jsonify({"status": "success"})
+    except Exception as e: return jsonify({"status": "error", "msg": str(e)})
 
-        # 2. Decrypt Ticket
-        # Simulation of Decrypt(sk, Y_key)
-        session_key = b'SESSION_KEY_32_BYTES_FIXED____' 
-        sender_id_from_ticket = "192.168.1.10" # Placeholder
-
-        # 3. Challenge Response
-        # Generate Ra, Encrypt with SessionKey, Send back
-        ra = 12345
-        # encrypt(ra + 1)
-        # send_pickle(client, encrypted_ra_plus_one)
-
-        print("!!!! User Trusted !!!!")
-        return session_key
-
-# ========================== Main Execution =======================================
-
-pk, sk = keygen()
-A, t = pk
-user = User(t, sk, pk)
-
-# ++++++++++++++++ CURRENT MACHINE IP ++++++++++++++++\
-IP = "192.168.3.11" # IP of Kali 2
-
-check = "0"
-while check != "3":
-    check = input("1. Register \t2. Login \t3. Cancel: \n --> ")
+@app.route('/send_file', methods=['POST'])
+def send_file():
+    if not STATE["auth"]: return "Not Authenticated", 403
+    f = request.files['file']
+    content = f.read()
     
-    if check == "1":
-        send("Registration")
-        user.register(IP)
+    # Simple XOR Encryption with the Decrypted Session Key
+    key = STATE["session_key"]
+    encrypted = bytes(content[i] ^ key[i % 32] for i in range(len(content)))
+    
+    try:
+        r = requests.post(f"http://{DEST_IP}:4443/receive", 
+                          files={'file': (f.filename, encrypted)})
+        return r.text
+    except: return "Destination Unreachable", 500
 
-    elif check == "2":
-        send("login")
-        user.login(IP)
-        state = input("1. Send \t 2. Receive\t ")
+@app.route('/receive', methods=['POST'])
+def receive():
+    if not STATE["auth"]: return "Unauthorized", 401
+    f = request.files['file']
+    enc_data = f.read()
+    
+    # Decryption
+    key = STATE["session_key"]
+    decrypted = bytes(enc_data[i] ^ key[i % 32] for i in range(len(enc_data)))
+    
+    save_path = os.path.join(SAVE_DIR, f.filename)
+    with open(save_path, 'wb') as out:
+        out.write(decrypted)
+        
+    print(f"[SUCCESS] File saved and decrypted at {save_path}")
+    return "File received successfully", 200
 
-        if state == "1":
-            pass # Sender logic
-
-        elif state == "2":
-            send("RECEIVER_MODE")
-            
-            # Perform Authentication and get Session Key
-            session_key = user.kerberos_recived(sk, client, IP)
-
-            if session_key:
-                print("\n--- Authentication Successful. Waiting for File ---")
-                
-                try:
-                    # 1. Receive the Packet (Filename, Nonce, EncryptedData)
-                    packet = recv_pickle(client)
-                    
-                    if isinstance(packet, tuple) and len(packet) == 3:
-                        filename, nonce, encrypted_data = packet
-                        
-                        print(f"Receiving encrypted file: {filename}")
-                        
-                        # 2. Decrypt using SessionKey + Nonce
-                        # (XOR is symmetric, so we use the same stream_cipher function)
-                        decrypted_data = stream_cipher(session_key, nonce, encrypted_data)
-                        
-                        # 3. Save the file
-                        save_name = "received_" + filename
-                        with open(save_name, 'wb') as f:
-                            f.write(decrypted_data)
-                            
-                        print(f"File saved as: {save_name}")
-                        print(f"First 50 bytes: {decrypted_data[:50]}")
-                    else:
-                        print("Invalid data format received.")
-                        
-                except Exception as e:
-                    print(f"Error receiving file: {e}")
-            else:
-                print("Authentication Failed.")
-
-    elif check == "3":
-        client.close()
-        break
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=4443)
