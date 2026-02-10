@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Secure GNS3 Transfer</title>
+    <style>
+        body { font-family: sans-serif; background: #121212; color: #eee; text-align: center; padding-top: 50px; }
+        .box { background: #1e1e1e; padding: 30px; border-radius: 10px; display: inline-block; border: 1px solid #333; }
+        .btn { padding: 10px 20px; margin: 5px; cursor: pointer; border-radius: 5px; border: none; font-weight: bold; }
+        .btn-blue { background: #007bff; color: white; }
+        .btn-green { background: #28a745; color: white; }
+        .status { margin-bottom: 20px; color: #aaa; }
+    </style>
+</head>
+<body>
+    <div class="box">
+        <h2>Secure File Exchange</h2>
+        <div class="status" id="stat">Wait for action...</div>
+        
+        <button class="btn btn-blue" onclick="call('/register')">1. REGISTER</button>
+        <button class="btn btn-blue" onclick="call('/login')">2. LOGIN</button>
+        <button class="btn btn-blue" onclick="call('/authenticate')">3. GET KEY</button>
+        
+        <hr style="border: 0.1px solid #333; margin: 20px 0;">
+        
+        <input type="file" id="f">
+        <button class="btn btn-green" onclick="upload()">SEND FILE SECURELY</button>
+    </div>
+
+    <script>
+        function call(url) {
+            document.getElementById('stat').innerText = "Processing...";
+            fetch(url, {method: 'POST'})
+            .then(r => r.json())
+            .then(d => {
+                document.getElementById('stat').innerText = d.status === 'success' ? "Done: " + url : "Error";
+            });
+        }
+
+        function upload() {
+            const file = document.getElementById('f').files[0];
+            const fd = new FormData();
+            fd.append('file', file);
+            document.getElementById('stat').innerText = "Encrypting & Sending...";
+            fetch('/send_file', {method: 'POST', body: fd})
+            .then(r => r.text())
+            .then(t => { alert(t); document.getElementById('stat').innerText = "Ready"; });
+        }
+    </script>
+</body>
+</html>
